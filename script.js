@@ -20,14 +20,21 @@ let tipoBarInst    = null;
 let detectedYear   = new Date().getFullYear();
 
 // ─── ESTADO TABLA DE TRANSACCIONES ────────────────────
-let txCurrentRows  = [];  // filas actuales antes de filtros de columna
-let txColFilters   = {};  // colKey → Set<string> | vacío = sin filtro
-let txOpenCol      = null; // columna cuyo dropdown está abierto
+let txCurrentRows  = [];    // filas actuales antes de filtros de columna
+let txColFilters   = {};    // colKey → Set<string> | vacío = sin filtro
+let txOpenCol      = null;  // columna cuyo dropdown está abierto
+let txSortCol      = null;  // columna activa de ordenamiento
+let txSortDir      = null;  // 'asc' | 'desc' | null
 
-// ─── ESTADO TABLA DESGLOSE POR TIPO ───────────────────
-let catAllRows     = [];  // todas las filas del desglose (rebuilt en render)
-let catColFilters  = {};  // colKey → Set<string>
-let catOpenCol     = null;
+// ─── CONTROLADORES TABLAS DESGLOSE ─────────────────────
+// Patrón: cada tabla tiene su propio estado encapsulado.
+function makeCatCtrl(tableId, bodyId, badgeId, label) {
+  return { allRows:[], colFilters:{}, openCol:null, tableId, bodyId, badgeId, label };
+}
+// Se instancian globalmente; se recargan en cada renderCategoryTable()
+const catIngCtrl = makeCatCtrl('catTableIng', 'catBodyIng', 'catBadgeIng', 'Ingresos');
+const catEgrCtrl = makeCatCtrl('catTableEgr', 'catBodyEgr', 'catBadgeEgr', 'Egresos');
+let   catActiveCtrl = null;  // controller con dropdown abierto
 
 // ─── PALETA ──────────────────────────────────────────
 const PALETTE = [
@@ -227,8 +234,18 @@ function parseSheetStrings(ws, tipoReg, dateHints, totalHints, tipoHints, nameHi
     const total = parseMonto(rawTotal);
     if (isNaN(total) || total === 0) continue;
 
-    const tipo    = cTipo   >= 0 && row[cTipo]   ? String(row[cTipo]).trim()   : 'Sin tipo';
-    const nombre  = cNombre >= 0 && row[cNombre] ? String(row[cNombre]).trim() : '—';
+    // ── Detectar y OMITIR filas de totales / resumen ──────
+    // Una fila de total desnuda: sin fecha, sin proveedor, sin tipo → solo el número
+    const rawTipo   = cTipo   >= 0 ? String(row[cTipo]   || '').trim() : '';
+    const rawNombre = cNombre >= 0 ? String(row[cNombre] || '').trim() : '';
+    const isTotalRow =
+      !rawFecha && !rawTipo && !rawNombre;           // sin fecha + sin contexto
+    const isLabeledTotal = /^(total|totales|suma|subtotal)/i.test(rawNombre) ||
+                           /^(total|totales|suma|subtotal)/i.test(rawTipo);
+    if (isTotalRow || isLabeledTotal) continue;
+
+    const tipo    = rawTipo   || 'Sin tipo';
+    const nombre  = rawNombre || '—';
     const importe = cImporte >= 0 ? (parseMonto(row[cImporte] || '0') || 0) : Math.abs(total);
     const iva     = cIva     >= 0 ? (parseMonto(row[cIva]     || '0') || 0) : 0;
     const ret     = cRet     >= 0 ? (parseMonto(row[cRet]     || '0') || 0) : 0;
@@ -633,67 +650,72 @@ function renderTipoBar(rows, canvasId, color, badgeId) {
 }
 
 // ══════════════════════════════════════════════════════
-// TABLA DESGLOSE POR TIPO — con filtros tipo Excel
+// TABLAS DESGLOSE POR TIPO — controlador genérico
 // ══════════════════════════════════════════════════════
 
 const CAT_COLS = [
-  { key:'cat',   label:'Tipo',          align:'left',  filterable:true  },
-  { key:'tipo',  label:'Movimiento',    align:'left',  filterable:true  },
-  { key:'total', label:'Total',         align:'right', filterable:false },
-  { key:'pct',   label:'% del Gasto',   align:'right', filterable:false },
-  { key:'count', label:'Transacciones', align:'right', filterable:false },
+  { key:'cat',   label:'Tipo',          align:'left',  filterable:true,  numeric:false },
+  { key:'total', label:'Total',         align:'right', filterable:false, numeric:true  },
+  { key:'pct',   label:'% del Total',   align:'right', filterable:false, numeric:false },
+  { key:'count', label:'Transacciones', align:'right', filterable:false, numeric:false },
 ];
 
 function catGetVal(row, key) { return String(row[key] ?? ''); }
 
-function renderCategoryTable(rows) {
-  const egr      = rows.filter(r => r.tipo_registro === 'Egreso');
-  const ing      = rows.filter(r => r.tipo_registro === 'Ingreso');
-  const totalEgr = egr.reduce((s, r) => s + r.monto, 0);
-
-  const byCatE = agrupar(egr, 'tipo');
-  const byCatI = agrupar(ing, 'tipo');
-  const cntE   = contar(egr, 'tipo');
-  const cntI   = contar(ing, 'tipo');
-
-  const allCats = new Set([...Object.keys(byCatE), ...Object.keys(byCatI)]);
-  const entries = [];
-  for (const cat of allCats) {
-    if (byCatE[cat]) {
-      const t = byCatE[cat];
-      entries.push({ cat, tipo:'Egreso',  total:t, count:cntE[cat]||0, pct: totalEgr > 0 ? t/totalEgr*100 : 0 });
-    }
-    if (byCatI[cat]) {
-      entries.push({ cat, tipo:'Ingreso', total:byCatI[cat], count:cntI[cat]||0, pct: 0 });
-    }
-  }
-  entries.sort((a, b) => b.total - a.total);
-
-  catAllRows    = entries;
-  catColFilters = {};
-  catOpenCol    = null;
-  buildCatHeader();
-  refreshCatTable();
+/** Construye las entries de desglose para un array de rows del mismo tipo */
+function buildCatEntries(rows) {
+  const total = rows.reduce((s, r) => s + r.monto, 0);
+  const byTipo = agrupar(rows, 'tipo');
+  const cnt    = contar(rows, 'tipo');
+  return Object.keys(byTipo)
+    .map(cat => ({
+      cat,
+      total: byTipo[cat],
+      count: cnt[cat] || 0,
+      pct:   total > 0 ? byTipo[cat] / total * 100 : 0,
+    }))
+    .sort((a, b) => b.total - a.total);
 }
 
-function buildCatHeader() {
-  const thead = document.querySelector('#categoryTable thead tr');
+function renderCategoryTable(rows) {
+  const ingRows = rows.filter(r => r.tipo_registro === 'Ingreso');
+  const egrRows = rows.filter(r => r.tipo_registro === 'Egreso');
+
+  // Cargar controladores y renderizar cada tabla
+  catIngCtrl.allRows    = buildCatEntries(ingRows);
+  catIngCtrl.colFilters = {};
+  catIngCtrl.openCol    = null;
+  buildCatHeader(catIngCtrl);
+  refreshCatTable(catIngCtrl);
+
+  catEgrCtrl.allRows    = buildCatEntries(egrRows);
+  catEgrCtrl.colFilters = {};
+  catEgrCtrl.openCol    = null;
+  buildCatHeader(catEgrCtrl);
+  refreshCatTable(catEgrCtrl);
+}
+
+function buildCatHeader(ctrl) {
+  const thead = document.querySelector(`#${ctrl.tableId} thead tr`);
   if (!thead) return;
   thead.innerHTML = '';
   CAT_COLS.forEach(col => {
     const th = document.createElement('th');
-    th.className = col.align === 'right' ? 'text-right cat-th-right' : 'cat-th-left';
+    th.className = col.align === 'right' ? 'cat-th-right' : 'cat-th-left';
     if (col.filterable) {
       th.innerHTML = `
         <span class="th-label">${col.label}</span>
-        <button class="tx-filter-btn cat-filter-btn" data-catcol="${col.key}" title="Filtrar por ${col.label}">
+        <button class="tx-filter-btn cat-filter-btn" title="Filtrar por ${col.label}">
           <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
             <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
           </svg>
         </button>`;
-      th.querySelector('.cat-filter-btn').addEventListener('click', e => {
+      const btn = th.querySelector('.cat-filter-btn');
+      btn._catCtrl = ctrl;
+      btn._catKey  = col.key;
+      btn.addEventListener('click', e => {
         e.stopPropagation();
-        toggleCatDropdown(col.key, e.currentTarget);
+        toggleCatDropdown(e.currentTarget._catCtrl, e.currentTarget._catKey, e.currentTarget);
       });
     } else {
       th.innerHTML = `<span class="th-label">${col.label}</span>`;
@@ -702,9 +724,9 @@ function buildCatHeader() {
   });
 }
 
-function getCatFiltered() {
-  return catAllRows.filter(row => {
-    for (const [key, allowed] of Object.entries(catColFilters)) {
+function getCatFiltered(ctrl) {
+  return ctrl.allRows.filter(row => {
+    for (const [key, allowed] of Object.entries(ctrl.colFilters)) {
       if (!allowed || allowed.size === 0) continue;
       if (!allowed.has(catGetVal(row, key))) return false;
     }
@@ -712,44 +734,48 @@ function getCatFiltered() {
   });
 }
 
-function refreshCatTable() {
-  const visible = getCatFiltered();
-  renderCatBody(visible);
-  document.getElementById('tableBadge').textContent =
-    visible.length === catAllRows.length
-      ? `${visible.length} categorías`
-      : `${visible.length} de ${catAllRows.length} categorías`;
+function refreshCatTable(ctrl) {
+  const visible = getCatFiltered(ctrl);
+  renderCatBody(ctrl, visible);
 
-  // Actualizar estado de botones filtro
-  CAT_COLS.filter(c => c.filterable).forEach(c => {
-    const btn = document.querySelector(`.cat-filter-btn[data-catcol="${c.key}"]`);
-    if (!btn) return;
-    const isActive = !!(catColFilters[c.key] && catColFilters[c.key].size > 0);
-    btn.classList.toggle('active', isActive);
-    let dot = btn.querySelector('.tx-filter-dot');
-    if (isActive && !dot) { dot = document.createElement('span'); dot.className='tx-filter-dot'; btn.appendChild(dot); }
-    if (!isActive && dot) dot.remove();
+  const badge = document.getElementById(ctrl.badgeId);
+  if (badge) badge.textContent =
+    visible.length === ctrl.allRows.length
+      ? `${visible.length} tipos`
+      : `${visible.length} de ${ctrl.allRows.length} tipos`;
+
+  // Actualizar estado de botones de filtro
+  CAT_COLS.filter(c => c.filterable).forEach(col => {
+    // Encuentra el botón de ESTE ctrl buscando por _catCtrl
+    const allBtns = document.querySelectorAll('.cat-filter-btn');
+    allBtns.forEach(btn => {
+      if (btn._catCtrl !== ctrl || btn._catKey !== col.key) return;
+      const isActive = !!(ctrl.colFilters[col.key] && ctrl.colFilters[col.key].size > 0);
+      btn.classList.toggle('active', isActive);
+      let dot = btn.querySelector('.tx-filter-dot');
+      if (isActive && !dot) { dot = document.createElement('span'); dot.className='tx-filter-dot'; btn.appendChild(dot); }
+      if (!isActive && dot) dot.remove();
+    });
   });
 }
 
-function renderCatBody(entries) {
-  const tbody = document.getElementById('categoryTableBody');
-  const frag  = document.createDocumentFragment();
+function renderCatBody(ctrl, entries) {
+  const tbody = document.getElementById(ctrl.bodyId);
+  if (!tbody) return;
+  const frag = document.createDocumentFragment();
+
   for (const e of entries) {
-    const isInc = e.tipo === 'Ingreso';
     const tr = document.createElement('tr');
+    const pctBar = e.pct > 0
+      ? `<div class="progress-cell">
+           <span class="pct-label">${e.pct.toFixed(1)}%</span>
+           <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(e.pct,100)}%"></div></div>
+         </div>`
+      : '<span class="td-nil">—</span>';
     tr.innerHTML = `
       <td class="cat-td-nombre"><strong>${escHtml(e.cat)}</strong></td>
-      <td class="cat-td-mov"><span class="type-badge ${isInc?'type-income':'type-expense'}">${e.tipo}</span></td>
       <td class="text-right cat-td-total">${formatMoney(e.total)}</td>
-      <td class="text-right cat-td-pct">
-        ${e.tipo==='Egreso' && e.pct > 0
-          ? `<div class="progress-cell">
-               <span class="pct-label">${e.pct.toFixed(1)}%</span>
-               <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(e.pct,100)}%"></div></div>
-             </div>`
-          : '<span class="td-nil">—</span>'}
-      </td>
+      <td class="text-right cat-td-pct">${pctBar}</td>
       <td class="text-right cat-td-count">${e.count.toLocaleString('es-MX')}</td>`;
     frag.appendChild(tr);
   }
@@ -757,25 +783,28 @@ function renderCatBody(entries) {
   tbody.appendChild(frag);
 }
 
-// ── DROPDOWN PARA TABLA DESGLOSE ──
-function toggleCatDropdown(colKey, btn) {
+// ── DROPDOWN PARA TABLAS DESGLOSE (genérico) ──
+function toggleCatDropdown(ctrl, colKey, btn) {
   const existing = document.getElementById('txDropdownPanel');
-  if (catOpenCol === colKey && existing) { closeCatDropdown(); return; }
+  if (catActiveCtrl === ctrl && ctrl.openCol === colKey && existing) {
+    closeCatDropdown(); return;
+  }
   closeCatDropdown();
-  catOpenCol = colKey;
-  openCatDropdown(colKey, btn);
+  catActiveCtrl = ctrl;
+  ctrl.openCol  = colKey;
+  openCatDropdown(ctrl, colKey, btn);
 }
 
-function openCatDropdown(colKey, anchorBtn) {
-  const col      = CAT_COLS.find(c => c.key === colKey);
-  const allVals  = [...new Set(catAllRows.map(r => catGetVal(r, colKey)))].sort();
-  const activeSet = catColFilters[colKey] || null;
+function openCatDropdown(ctrl, colKey, anchorBtn) {
+  const col       = CAT_COLS.find(c => c.key === colKey);
+  const allVals   = [...new Set(ctrl.allRows.map(r => catGetVal(r, colKey)))].sort();
+  const activeSet = ctrl.colFilters[colKey] || null;
 
   const panel = document.createElement('div');
-  panel.id        = 'txDropdownPanel';   // mismo id → close function funciona
+  panel.id        = 'txDropdownPanel';
   panel.className = 'tx-dropdown-panel';
   panel.innerHTML = `
-    <div class="tx-dp-title">${escHtml(col?.label || colKey)}</div>
+    <div class="tx-dp-title">${escHtml(ctrl.label + ' — ' + (col?.label || colKey))}</div>
     <div class="tx-dp-head">
       <div class="tx-dp-search-wrap">
         <svg class="tx-dp-search-icon" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -792,11 +821,9 @@ function openCatDropdown(colKey, anchorBtn) {
   document.body.appendChild(panel);
 
   const list = panel.querySelector('#txDpList');
-
   function renderOptions(filterText) {
     list.innerHTML = '';
     const filtered = allVals.filter(v => !filterText || v.toLowerCase().includes(filterText));
-    // Select All
     const saRow = document.createElement('label');
     saRow.className = 'tx-dp-item tx-dp-select-all-item';
     const allChecked  = filtered.every(v => !activeSet || activeSet.has(v));
@@ -808,7 +835,6 @@ function openCatDropdown(colKey, anchorBtn) {
     cbAll.addEventListener('change', () => list.querySelectorAll('.tx-dp-value-cb').forEach(i=>i.checked=cbAll.checked));
     list.appendChild(saRow);
     const sep = document.createElement('div'); sep.className='tx-dp-sep'; list.appendChild(sep);
-
     filtered.forEach(val => {
       const checked = !activeSet || activeSet.has(val);
       const item = document.createElement('label');
@@ -822,7 +848,7 @@ function openCatDropdown(colKey, anchorBtn) {
         const cbs = [...list.querySelectorAll('.tx-dp-value-cb')];
         const sel = cbs.filter(i=>i.checked).length;
         const cbA = list.querySelector('#txDpCbAll');
-        if (cbA) { cbA.checked = sel===cbs.length; cbA.indeterminate = sel>0 && sel<cbs.length; }
+        if (cbA) { cbA.checked=sel===cbs.length; cbA.indeterminate=sel>0&&sel<cbs.length; }
       }
     });
   }
@@ -830,18 +856,17 @@ function openCatDropdown(colKey, anchorBtn) {
   panel.querySelector('#txDpSearch').addEventListener('input', e => renderOptions(e.target.value.toLowerCase()));
   panel.querySelector('#txDpApply').addEventListener('click', () => {
     const checked = [...list.querySelectorAll('.tx-dp-value-cb:checked')].map(i=>i.value);
-    if (checked.length === allVals.length || checked.length === 0) delete catColFilters[colKey];
-    else catColFilters[colKey] = new Set(checked);
-    closeCatDropdown(); refreshCatTable();
+    if (checked.length === allVals.length || checked.length === 0) delete ctrl.colFilters[colKey];
+    else ctrl.colFilters[colKey] = new Set(checked);
+    closeCatDropdown(); refreshCatTable(ctrl);
   });
   panel.querySelector('#txDpClear').addEventListener('click', () => {
-    delete catColFilters[colKey]; closeCatDropdown(); refreshCatTable();
+    delete ctrl.colFilters[colKey]; closeCatDropdown(); refreshCatTable(ctrl);
   });
 
-  const rect   = anchorBtn.getBoundingClientRect();
-  const panelW = 280;
+  const rect = anchorBtn.getBoundingClientRect();
   panel.style.top  = `${rect.bottom + 4}px`;
-  panel.style.left = `${Math.min(rect.left, window.innerWidth - panelW - 8)}px`;
+  panel.style.left = `${Math.min(rect.left, window.innerWidth - 288)}px`;
   requestAnimationFrame(() => {
     const ph = panel.offsetHeight;
     if (rect.bottom + ph > window.innerHeight - 8) panel.style.top = `${rect.top - ph - 4}px`;
@@ -856,7 +881,7 @@ function outsideCatClick(e) {
 function closeCatDropdown() {
   const panel = document.getElementById('txDropdownPanel');
   if (panel) panel.remove();
-  catOpenCol = null;
+  if (catActiveCtrl) { catActiveCtrl.openCol = null; catActiveCtrl = null; }
   document.removeEventListener('click', outsideCatClick);
 }
 
@@ -911,17 +936,25 @@ function renderTxTable(rows) {
     if (!b.fecha) return -1;
     return b.fecha - a.fecha;
   });
-  txColFilters  = {};
-  txOpenCol     = null;
+  txColFilters = {};
+  txOpenCol    = null;
+  txSortCol    = null;
+  txSortDir    = null;
+  // Reset botones rápidos
+  ['Ingreso','Egreso'].forEach(t => {
+    const b = document.getElementById(`qf${t}`);
+    if (b) b.classList.remove('active');
+  });
   buildTxHeader();
   buildTxYearControl();
   refreshTxTable();
 }
 
 function refreshTxTable() {
-  const visible = getTxFiltered();
+  const filtered = getTxFiltered();
+  const visible  = txSortRows(filtered);   // sort DESPUÉS de filtrar
   renderTxBody(visible);
-  renderTxFooter(visible);
+  renderTxFooter(filtered);  // totales sobre TODOS los filtrados (independiente del sort)
 
   // Badge de registros
   const badge = document.getElementById('txBadge');
@@ -975,7 +1008,15 @@ function buildTxHeader() {
   thead.innerHTML = '';
   TX_COLS.forEach(col => {
     const th = document.createElement('th');
-    th.className = col.align === 'right' ? 'text-right' : '';
+    th.className = (col.align === 'right' ? 'text-right ' : '') + 'tx-th-sortable';
+    th.dataset.col = col.key;
+
+    // Icono de ordenamiento
+    const sortIcon = `<span class="tx-sort-icon" data-col="${col.key}">
+      <svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" class="sort-neutral">
+        <path d="M7 15l5 5 5-5M7 9l5-5 5 5"/>
+      </svg></span>`;
+
     if (col.filterable) {
       th.innerHTML = `
         <span class="th-label">${col.label}</span>
@@ -983,16 +1024,84 @@ function buildTxHeader() {
           <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
             <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
           </svg>
-        </button>`;
+        </button>
+        ${sortIcon}`;
       th.querySelector('.tx-filter-btn').addEventListener('click', e => {
         e.stopPropagation();
         toggleTxDropdown(col.key, e.currentTarget);
       });
     } else {
-      th.innerHTML = `<span class="th-label">${col.label}</span>`;
+      th.innerHTML = `<span class="th-label">${col.label}</span>${sortIcon}`;
     }
+
+    // Click en la columna (no en el botón filtro) → ordenar
+    th.addEventListener('click', e => {
+      if (e.target.closest('.tx-filter-btn')) return;
+      cycleTxSort(col.key);
+    });
+
     thead.appendChild(th);
   });
+}
+
+/** Cicla el ordenamiento: null → asc → desc → null */
+function cycleTxSort(colKey) {
+  if (txSortCol !== colKey) { txSortCol = colKey; txSortDir = 'asc'; }
+  else if (txSortDir === 'asc') { txSortDir = 'desc'; }
+  else { txSortCol = null; txSortDir = null; }
+  updateSortIcons();
+  refreshTxTable();
+}
+
+/** Actualiza los iconos de sort en el thead */
+function updateSortIcons() {
+  document.querySelectorAll('.tx-sort-icon').forEach(el => {
+    const col = el.dataset.col;
+    el.innerHTML = col === txSortCol
+      ? (txSortDir === 'asc'
+          ? `<svg width="10" height="10" fill="none" stroke="var(--accent)" stroke-width="2.5" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>`
+          : `<svg width="10" height="10" fill="none" stroke="var(--accent)" stroke-width="2.5" viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>`)
+      : `<svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" class="sort-neutral"><path d="M7 15l5 5 5-5M7 9l5-5 5 5"/></svg>`;
+  });
+}
+
+/** Ordena rows según txSortCol / txSortDir */
+function txSortRows(rows) {
+  if (!txSortCol || !txSortDir) return rows;
+  const col   = TX_COLS.find(c => c.key === txSortCol);
+  const isNum = col && col.numeric;
+  return [...rows].sort((a, b) => {
+    let av, bv;
+    if (isNum) {
+      av = typeof a[txSortCol] === 'number' ? a[txSortCol] : 0;
+      bv = typeof b[txSortCol] === 'number' ? b[txSortCol] : 0;
+    } else {
+      av = txGetVal(a, txSortCol).toLowerCase();
+      bv = txGetVal(b, txSortCol).toLowerCase();
+    }
+    if (av < bv) return txSortDir === 'asc' ? -1 :  1;
+    if (av > bv) return txSortDir === 'asc' ?  1 : -1;
+    return 0;
+  });
+}
+
+/** Aplica filtro rápido de tipo (Ingresos / Egresos) */
+function applyQuickFilter(tipoReg) {
+  const btn = document.getElementById(`qf${tipoReg}`);
+  // Toggle: si ya está activo este filtro, quitar
+  const current = txColFilters['tipo_registro'];
+  const isActive = current && current.size === 1 && current.has(tipoReg);
+  if (isActive) {
+    delete txColFilters['tipo_registro'];
+  } else {
+    txColFilters['tipo_registro'] = new Set([tipoReg]);
+  }
+  // Sincronizar estado visual de los botones rápidos
+  ['Ingreso','Egreso'].forEach(t => {
+    const b = document.getElementById(`qf${t}`);
+    if (b) b.classList.toggle('active', !!(txColFilters['tipo_registro']?.has(t)));
+  });
+  refreshTxTable();
 }
 
 function renderTxBody(rows) {
@@ -1193,9 +1302,17 @@ function closeTxDropdown() {
   document.removeEventListener('click', outsideTxClick);
 }
 
-/** Limpia todos los filtros de columna activos (incluye año) */
+/** Limpia todos los filtros de columna activos (incluye año) y resetea sort */
 function clearAllTxFilters() {
   txColFilters = {};
+  txSortCol    = null;
+  txSortDir    = null;
+  // Reset botones rápidos
+  ['Ingreso','Egreso'].forEach(t => {
+    const b = document.getElementById(`qf${t}`);
+    if (b) b.classList.remove('active');
+  });
+  updateSortIcons();
   refreshTxTable();
   syncYearBtnState();
 }
